@@ -6,6 +6,7 @@ from torch import nn
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.datasets import make_classification
 from sklearn.preprocessing import StandardScaler
+from scipy.sparse import issparse
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 import matplotlib.pyplot as plt
 import os
@@ -13,7 +14,7 @@ os.makedirs("plots", exist_ok=True)
 
 # Noah Jacobson: SGD, SARAH
 # Advaith Subramanian Sahasranamam: SVRG
-# Kudzaishe Kadzimu: SAGA (to be added)
+# Kudzaishe Kadzimu: SAGA
 
 # run first:
 '''
@@ -285,9 +286,154 @@ class SVRG(OptimizerBase):
         self.step_count += 1
 
 
+
 # =============================================================================
-# HELPER: Full dataset loss (used by SARAH and SVRG outer loops)
+# INDEXED DATASET — needed by SAGA
 # =============================================================================
+
+class IndexedTensorDataset(torch.utils.data.Dataset):
+    """
+    Wraps a TensorDataset and also returns the sample index alongside
+    the data. SAGA needs to know WHICH sample was picked so it can
+    look up and update that sample's stored gradient in the table.
+
+    Normal DataLoader returns: (X_batch, y_batch)
+    This returns:              (indices, X_batch, y_batch)
+    """
+    def __init__(self, X, y):
+        self.X = X
+        self.y = y
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return idx, self.X[idx], self.y[idx]
+
+
+# =============================================================================
+# SAGA
+# =============================================================================
+
+class SAGA(OptimizerBase):
+    """
+    SAGA — Defazio et al., 2014. https://arxiv.org/abs/1407.0202
+    Implementation: Kudzaishe Kadzimu
+
+    Key idea: Maintain a TABLE of the most recent gradient for every
+    single training sample. Use these stored gradients to correct
+    the stochastic gradient estimate:
+
+        v = g_new(i) - grad_table[i] + grad_avg
+
+    where:
+        g_new(i)      = gradient computed on sample i right now
+        grad_table[i] = gradient computed on sample i LAST TIME it was picked
+        grad_avg      = average of ALL stored gradients in the table
+
+    Why this works:
+        - grad_table[i] and g_new(i) share the same data point i,
+          so their noise partially cancels
+        - grad_avg is a running estimate of the full gradient,
+          acting as a low-variance anchor (like mu in SVRG)
+        - As training progresses, the table entries get fresher
+          and grad_avg approaches the true gradient mean → variance → 0
+
+    Memory cost: O(n × d) — one gradient vector per training sample.
+        This is SAGA's main downside vs SVRG/SARAH which only need O(d).
+        For 20,000 samples with 50 features: 20000 × 50 = 1,000,000 floats.
+
+    No outer loop needed — SAGA updates the table incrementally,
+    one sample at a time, making it simpler to implement than SVRG.
+    """
+    def __init__(self, params, lr, n_samples, n_features):
+        super().__init__(params, lr)
+
+        self.n = n_samples
+
+        # Gradient table: shape (n_samples, n_features)
+        # grad_table_w[i] = most recent weight gradient for sample i
+        # grad_table_b[i] = most recent bias gradient for sample i
+        # Initialised to zero — equivalent to assuming zero gradient at start
+        self.grad_table_w = np.zeros((n_samples, n_features))
+        self.grad_table_b = np.zeros(n_samples)
+
+        # Running average of all stored gradients
+        # grad_avg = (1/n) * sum of all rows in grad_table
+        # Updated incrementally — no need to sum the whole table each step
+        self.grad_avg_w = np.zeros(n_features)
+        self.grad_avg_b = 0.0
+
+    def saga_step(self, indices, X_batch, y_batch):
+        """
+        Performs one SAGA update for a mini-batch.
+
+        For each sample in the batch:
+            1. Compute fresh gradient g_new for that sample
+            2. Compute corrected gradient: v = g_new - grad_table[i] + grad_avg
+            3. Update grad_avg incrementally (avoids full table sum)
+            4. Update grad_table[i] with g_new
+            5. Take gradient step using average of corrected gradients
+
+        Args:
+            indices:  tensor of sample indices for this batch
+            X_batch:  feature matrix for this batch
+            y_batch:  labels for this batch
+        """
+        indices = indices.numpy()
+        X_np    = X_batch.numpy()
+        y_np    = y_batch.numpy().flatten()
+
+        # Accumulate corrected gradients across the batch
+        batch_dw = np.zeros_like(self.grad_avg_w)
+        batch_db = 0.0
+
+        for j, i in enumerate(indices):
+            xi = X_np[j]
+            yi = y_np[j]
+
+            # Current model weights and bias (read from PyTorch params)
+            w = self.params[0].data.numpy().flatten()  # weight vector
+            b = self.params[1].data.numpy().item()     # bias scalar
+
+            # Forward pass: logistic regression probability
+            zi  = xi @ w + b
+            pi  = 1.0 / (1.0 + np.exp(-zi))   # sigmoid
+
+            # Raw gradient for sample i at current parameters
+            g_new_w = (pi - yi) * xi   # shape (d,)
+            g_new_b = (pi - yi)        # scalar
+
+            # SAGA corrected gradient: g_new - old_table_entry + running_avg
+            dw = g_new_w - self.grad_table_w[i] + self.grad_avg_w
+            db = g_new_b - self.grad_table_b[i] + self.grad_avg_b
+
+            batch_dw += dw
+            batch_db += db
+
+            # Update running average BEFORE updating the table
+            # Formula: avg += (g_new - old_entry) / n
+            # This is O(d) — no need to recompute the whole sum
+            self.grad_avg_w += (g_new_w - self.grad_table_w[i]) / self.n
+            self.grad_avg_b += (g_new_b - self.grad_table_b[i]) / self.n
+
+            # Store fresh gradient in the table for sample i
+            self.grad_table_w[i] = g_new_w
+            self.grad_table_b[i] = g_new_b
+
+        # Average corrected gradient over the batch
+        batch_size = len(indices)
+        batch_dw /= batch_size
+        batch_db /= batch_size
+
+        # Gradient step — update PyTorch parameters directly
+        with torch.no_grad():
+            self.params[0] -= self.lr * torch.tensor(
+                batch_dw.reshape(self.params[0].shape), dtype=torch.float32)
+            self.params[1] -= self.lr * torch.tensor(
+                np.array([batch_db]), dtype=torch.float32)
+
+
 
 def full_loss(model, dataset, loss_criterion):
     """
@@ -308,6 +454,7 @@ def train(model, optimizer, loader, epochs, method, dataset):
     """
     Unified training loop for all methods.
     Handles the different outer-loop requirements for SARAH and SVRG.
+    SAGA uses its own saga_step() and bypasses PyTorch autograd entirely.
 
     Returns:
         history: list of average losses (one per epoch, not per iteration)
@@ -339,24 +486,39 @@ def train(model, optimizer, loader, epochs, method, dataset):
         # ----------------------------------------------------------
         epoch_losses = []  # collect batch losses, average at end of epoch
 
-        for X, y in loader:
-            X, y = X.float(), y.float()
+        for batch in loader:
 
-            # SVRG: check if it's time for a new snapshot
-            if method == "svrg":
-                if optimizer.step_count >= optimizer.inner_loop_size:
-                    optimizer.update_snapshot(model, dataset, loss_fn)
+            # SAGA loader returns (indices, X, y); all others return (X, y)
+            if method == "saga":
+                indices, X, y = batch
+                X, y = X.float(), y.float()
 
-                # Compute gradient at snapshot for this mini-batch
-                optimizer.compute_snapshot_grad(X, y, loss_fn)
+                # SAGA bypasses PyTorch autograd entirely — it computes
+                # gradients manually using its own sigmoid implementation
+                optimizer.saga_step(indices, X, y)
 
-            # Compute gradient at current parameters
-            optimizer.zero_grad()
-            logits = model(X)
-            loss = loss_fn(logits, y)
-            loss.backward()
-            optimizer.store_grads()
-            optimizer.step()
+                # Compute loss separately just for logging (no backward needed)
+                with torch.no_grad():
+                    logits = model(X)
+                    loss = loss_fn(logits, y)
+
+            else:
+                X, y = batch
+                X, y = X.float(), y.float()
+
+                # SVRG: check if it's time for a new snapshot
+                if method == "svrg":
+                    if optimizer.step_count >= optimizer.inner_loop_size:
+                        optimizer.update_snapshot(model, dataset, loss_fn)
+                    optimizer.compute_snapshot_grad(X, y, loss_fn)
+
+                # Compute gradient at current parameters
+                optimizer.zero_grad()
+                logits = model(X)
+                loss = loss_fn(logits, y)
+                loss.backward()
+                optimizer.store_grads()
+                optimizer.step()
 
             epoch_losses.append(loss.item())
 
@@ -369,7 +531,9 @@ def train(model, optimizer, loader, epochs, method, dataset):
         # Evaluation stats at end of epoch
         model.eval()
         with torch.no_grad():
-            X_full, y_full = dataset[:]
+            # IndexedTensorDataset returns (idx, X, y); TensorDataset returns (X, y)
+            raw = dataset[:]
+            X_full, y_full = (raw[1], raw[2]) if len(raw) == 3 else (raw[0], raw[1])
             raw_scores = model(X_full)
             probs = torch.sigmoid(raw_scores).cpu().numpy().flatten()
             predictions = (probs >= 0.5).astype(int)
@@ -410,32 +574,125 @@ def plot_loss(history, method):
 
 
 # =============================================================================
+# DATASET LOADER
+# =============================================================================
+
+def load_dataset(name):
+    """
+    Loads and preprocesses a dataset by name.
+
+    Supported options:
+        synthetic   — make_classification (20k samples, 50 features)
+        mushrooms   — libsvm, 8124 samples, 112 features. Small, good for debugging.
+        a9a         — libsvm, 32561 samples, 123 features. Standard benchmark.
+        covtype     — libsvm, 581012 samples, 54 features. Large scale stress test.
+
+    All datasets are:
+        - Converted to dense numpy arrays if sparse
+        - StandardScaled (mean 0, std 1) for gradient stability
+        - Labels mapped to {0, 1} for BCEWithLogitsLoss
+
+    Returns:
+        X: np.ndarray of shape (n_samples, n_features), float32
+        y: np.ndarray of shape (n_samples,), float32, values in {0, 1}
+    """
+    print(f"Loading dataset: {name}")
+
+    if name == "synthetic":
+        X, y = make_classification(
+            n_samples=20000,
+            n_features=50,
+            n_informative=20,
+            n_redundant=5,
+            n_repeated=0,
+            class_sep=1.5,
+            flip_y=0.025,
+            random_state=0
+        )
+
+    else:
+        # libsvm datasets — requires: pip install libsvmdata
+        try:
+            from libsvmdata import fetch_libsvm
+        except ImportError:
+            raise ImportError(
+                "libsvmdata is not installed. Run: pip install libsvmdata"
+            )
+
+        # Map friendly names to libsvm dataset identifiers
+        # phishing: 11055 samples, 68 features — replaces mushrooms as small debug dataset
+        # a9a:      32561 samples, 123 features — standard benchmark
+        # covtype:  581012 samples, 54 features — large scale
+        # cod-rna:  59535 samples, 8 features  — medium scale alternative
+        libsvm_names = {
+            "phishing": "phishing",
+            "a9a":      "a9a",
+            "covtype":  "covtype.binary",
+            "cod-rna":  "cod-rna",
+        }
+
+        if name not in libsvm_names:
+            raise ValueError(
+                f"Unknown dataset '{name}'. "
+                f"Choose from: synthetic | phishing | a9a | covtype | cod-rna"
+            )
+
+        try:
+            # Use newer API if available (libsvmdata >= 0.5)
+            from libsvmdata import fetch_dataset
+            X, y = fetch_dataset(libsvm_names[name])
+        except ImportError:
+            X, y = fetch_libsvm(libsvm_names[name])
+
+        # libsvm data often comes as sparse scipy matrices — convert to dense
+        if issparse(X):
+            X = X.toarray()
+
+    # Scale features: zero mean, unit variance
+    # Critical for gradient methods — prevents features on different scales
+    # from causing wildly uneven gradient magnitudes
+    X = StandardScaler().fit_transform(X).astype(np.float32)
+
+    # Map labels to {0, 1} — BCEWithLogitsLoss requires binary labels
+    # libsvm datasets often use {-1, +1} or {1, 2}
+    unique = np.unique(y)
+    if set(unique) != {0.0, 1.0}:
+        y = (y == unique.max()).astype(np.float32)
+    else:
+        y = y.astype(np.float32)
+
+    print(f"  Samples: {X.shape[0]}, Features: {X.shape[1]}")
+    print(f"  Class balance: {np.mean(y):.2%} positive")
+
+    return X, y
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
 def main(args):
-    # Dataset
-    X, y = make_classification(
-        n_samples=20000,
-        n_features=50,
-        n_informative=20,
-        n_redundant=5,
-        n_repeated=0,
-        class_sep=0.5,
-        flip_y=0.05,
-        random_state=0
-    )
-
-    X = StandardScaler().fit_transform(X)
+    # ------------------------------------------------------------------
+    # Dataset loading
+    # ------------------------------------------------------------------
+    X, y = load_dataset(args.dataset)
     X = torch.tensor(X, dtype=torch.float32)
     y = torch.tensor(y, dtype=torch.float32).unsqueeze(1)  # shape (N, 1)
-    dataset = TensorDataset(X, y)
+
+    n_samples  = X.shape[0]
+    n_features = X.shape[1]
+
+    # SAGA needs an indexed dataset so it knows which sample index was picked.
+    # All other methods use the standard TensorDataset.
+    if args.method == "saga":
+        dataset = IndexedTensorDataset(X, y)
+    else:
+        dataset = TensorDataset(X, y)
+
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
-    n_samples = X.shape[0]
-
     # Model: simple logistic regression (single linear layer)
-    model = nn.Linear(X.shape[1], 1)
+    model = nn.Linear(n_features, 1)
 
     # Optimizer selection
     if args.method == "sgd":
@@ -453,8 +710,16 @@ def main(args):
             inner_loop_size=args.inner_loop_size
         )
 
+    elif args.method == "saga":
+        optimizer = SAGA(
+            model.parameters(),
+            lr=args.lr,
+            n_samples=n_samples,
+            n_features=n_features
+        )
+
     else:
-        raise ValueError("--method must be one of: sgd, sarah, svrg. (saga coming soon)")
+        raise ValueError("--method must be one of: sgd | sarah | svrg | saga")
 
     # Train
     history = train(model, optimizer, loader, args.epochs,
@@ -468,7 +733,7 @@ def main(args):
     plot_loss(history, args.method)
 
     # Comparison plot — overlays all methods that have been run
-    methods = ["sgd", "sarah", "svrg"]
+    methods = ["sgd", "sarah", "svrg", "saga"]
     plt.figure(figsize=(7, 4))
     for m in methods:
         try:
@@ -482,7 +747,7 @@ def main(args):
 
     plt.xlabel("Epoch")
     plt.ylabel("Average Loss")
-    plt.title("SGD vs SARAH vs SVRG")
+    plt.title(f"SGD vs SARAH vs SVRG vs SAGA ({args.dataset})")
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
@@ -497,7 +762,9 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Variance Reduction Methods Comparison")
     parser.add_argument("--method",           type=str,   required=True,
-                        help="Optimizer to use: sgd | sarah | svrg")
+                        help="Optimizer to use: sgd | sarah | svrg | saga")
+    parser.add_argument("--dataset",          type=str,   default="synthetic",
+                        help="Dataset: synthetic | phishing | a9a | covtype | cod-rna (default: synthetic)")
     parser.add_argument("--lr",               type=float, default=0.1,
                         help="Learning rate (default: 0.1)")
     parser.add_argument("--batch-size",       type=int,   default=128,
