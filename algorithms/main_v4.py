@@ -13,22 +13,11 @@ import os
 os.makedirs("plots", exist_ok=True)
 
 # Noah Jacobson: SGD, SARAH
-# Advaith Subramanian Sahasranamam: SVRG
-# Kudzaishe Kadzimu: SAGA
-
-# run first:
-'''
-conda create -n vr_optims python=3.9 pytorch torchvision cpuonly -c pytorch -c conda-forge
-conda activate vr_optims
-pip install matplotlib tqdm coloredlogs scikit-learn
-'''
-
-# example: python main_v4.py --method svrg --lr 0.05 --batch-size 128 --epochs 10 --inner-loop-size 100
-
+# Advaith Subramanian Sahasranamam: SAGA
+# Kudzaishe Kadzimu: SVRG
 
 # =============================================================================
 # BASE CLASS
-# =============================================================================
 
 class OptimizerBase:
     """
@@ -51,25 +40,18 @@ class OptimizerBase:
     def store_grads(self):
         """
         Copies gradients out of PyTorch's internal structure and saves them.
-        .clone() is critical — without it we'd just hold a reference to memory
-        that gets zeroed next iteration.
         """
         self.grads = [p.grad.clone() for p in self.params]
 
 
 # =============================================================================
 # SGD
-# =============================================================================
 
 class SGD(OptimizerBase):
     """
     Vanilla Stochastic Gradient Descent.
     Update rule: w = w - lr * g
     where g is the mini-batch gradient.
-
-    Problem: g is noisy — computed on a random subset of data.
-    That noise never goes away, creating a 'noise floor' that
-    prevents exact convergence regardless of step size.
     """
     def step(self):
         with torch.no_grad():
@@ -79,7 +61,6 @@ class SGD(OptimizerBase):
 
 # =============================================================================
 # SARAH
-# =============================================================================
 
 class SARAH(OptimizerBase):
     """
@@ -610,14 +591,7 @@ def load_dataset(name):
 
     Supported options:
         synthetic   — make_classification (20k samples, 50 features)
-        mushrooms   — libsvm, 8124 samples, 112 features. Small, good for debugging.
         a9a         — libsvm, 32561 samples, 123 features. Standard benchmark.
-        covtype     — libsvm, 581012 samples, 54 features. Large scale stress test.
-
-    All datasets are:
-        - Converted to dense numpy arrays if sparse
-        - StandardScaled (mean 0, std 1) for gradient stability
-        - Labels mapped to {0, 1} for BCEWithLogitsLoss
 
     Returns:
         X: np.ndarray of shape (n_samples, n_features), float32

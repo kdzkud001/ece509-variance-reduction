@@ -99,6 +99,96 @@ The logging code was integrated into the team's local `main_v4.py` and all four 
 
 ---
 
+### Prompt 6 — SAGA Conceptual Explanation and Pseudocode
+
+**Date**: April 29, 2026
+
+**Prompt**:
+> "Please explain SAGA SGD method for SGD, and give me a pseudocode to solidify understanding."
+
+**Output relied upon**:
+Claude explained the core concepts of SAGA, including the gradient table, the unbiased variance-reduced update direction, and the convergence advantages over vanilla SGD. It provided a pseudocode outlining the initialization of the gradient table, the per-iteration sample, update, and table replacement steps.
+
+**How it was used**:
+The explanation was used to build foundational understanding of SAGA prior to implementation. The pseudocode served as a reference scaffold for writing the initial Python prototype.
+
+---
+
+### Prompt 7 — Adding Bias Terms to SAGA Prototype
+
+**Date**: April 29, 2026
+
+**Prompt**:
+> "I have this SAGA prototype for logistic regression, and I would like to add biases to it. Please guide me through adding the derivative wrt the bias."
+
+**Output relied upon**:
+Claude identified and fixed a bug in the sigmoid function, suggested the correct form of the bias gradient (scalar derivative of the loss with respect to the bias term), and described how it could be incorporated into the `sample_gradient` function and tracked alongside the weight gradient in the SAGA update step.
+
+**How it was used**:
+The sigmoid bug fix was applied directly. The bias gradient derivation was reviewed against the logistic loss manually before being integrated into the prototype.
+
+---
+
+### Prompt 8 — Bug Confirmation in SAGA Implementation
+
+**Date**: April 29, 2026
+
+**Prompt**:
+> "Confirm that these are the only fixes."
+
+**Output relied upon**:
+Claude identified three additional issues beyond those already flagged: a bug in the `grad_avg` update (incorrect incremental formula), a missing argument in a function call, and incorrect ordering of the `grad_avg` update relative to the table replacement step.
+
+**How it was used**:
+All three issues were located in the code, verified by the team, and corrected. The ordering fix for `grad_avg` was cross-checked against the original SAGA paper (Defazio et al. 2014) to confirm correctness.
+
+---
+
+### Prompt 9 — Test Case Generation for SAGA
+
+**Date**: April 29, 2026
+
+**Prompt**:
+> "Please give me a sample test case."
+
+**Output relied upon**:
+Claude generated a test case using `make_classification` from scikit-learn to produce a synthetic binary classification dataset, and wrote a small script to run the SAGA implementation and verify convergence behavior.
+
+**How it was used**:
+The test script was run locally to confirm the implementation produced decreasing loss over iterations. Output was inspected visually before proceeding to real dataset evaluation.
+
+---
+
+### Prompt 10 — Visualizing Gradient Noise
+
+**Date**: April 29, 2026
+
+**Prompt**:
+> "How can I visualize the noise created by the gradient?"
+
+**Output relied upon**:
+Claude advised plotting the gradient norm over training steps as a proxy for gradient noise, noting that variance-reduced methods should show a decaying norm compared to SGD's persistent noise floor.
+
+**How it was used**:
+This recommendation directly motivated Prompt 5, in which gradient norm logging was formally added to the full experimental pipeline.
+
+---
+
+### Prompt 11 — IEEE-Style Pseudocode for Report
+
+**Date**: May 1, 2026
+
+**Prompt**:
+> "Given this code, please generate a pseudocode for an IEEE style paper. Remember to use small capitalizations and all other conventions where appropriate. Avoid ill-chosen variable names, ignore numpy by converting it into pseudocode. This is to be copy-pasted into MS word, into a one-cell table. Use 'Algorithm', 'Process', etc. for functions. Remember to also include the input and output for every function, and parse all super and subtext."
+
+**Output relied upon**:
+Claude produced IEEE-formatted pseudocode for the SAGA implementation, using small caps conventions, properly formatted sub- and superscripts, structured `Algorithm` and `Process` blocks with explicit **Input** and **Output** declarations, and variable names cleaned up from implementation-level names to notation appropriate for a formal paper.
+
+**How it was used**:
+The pseudocode was copied into a one-cell Word table in the report. Notation was reviewed by the team against the Defazio et al. 2014 paper and adjusted where variable naming diverged from the canonical presentation.
+
+---
+
 ## How Outputs Were Checked
 
 - All generated code was run locally in the project virtual environment and outputs were inspected before use

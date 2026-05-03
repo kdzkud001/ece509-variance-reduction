@@ -8,8 +8,8 @@
 | Name | Role |
 |---|---|
 | Noah Jacobson (Point of Contact) | SGD, SARAH implementation |
-| Kudzaishe Kadzimu | SAGA implementation |
-| Advaith Subramanian Sahasranamam | SVRG implementation |
+| Kudzaishe Kadzimu | SVRG implementation |
+| Advaith Subramanian Sahasranamam | SAGA implementation |
 
 ---
 
