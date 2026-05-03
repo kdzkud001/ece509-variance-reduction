@@ -346,10 +346,11 @@ class SAGA(OptimizerBase):
     No outer loop needed — SAGA updates the table incrementally,
     one sample at a time, making it simpler to implement than SVRG.
     """
-    def __init__(self, params, lr, n_samples, n_features):
+    def __init__(self, params, lr, n_samples, n_features, weight_decay=0.0):
         super().__init__(params, lr)
 
-        self.n = n_samples
+        self.n            = n_samples
+        self.weight_decay = weight_decay
 
         # Gradient table: shape (n_samples, n_features)
         # grad_table_w[i] = most recent weight gradient for sample i
@@ -404,6 +405,11 @@ class SAGA(OptimizerBase):
             g_new_w = (pi - yi) * xi   # shape (d,)
             g_new_b = (pi - yi)        # scalar
 
+            # L2 regularization gradient: d/dw [(lambda/2)||w||^2] = lambda * w
+            # Applied only to weights, not bias (standard practice)
+            if self.weight_decay > 0.0:
+                g_new_w = g_new_w + self.weight_decay * w
+
             # SAGA corrected gradient: g_new - old_table_entry + running_avg
             dw = g_new_w - self.grad_table_w[i] + self.grad_avg_w
             db = g_new_b - self.grad_table_b[i] + self.grad_avg_b
@@ -450,18 +456,39 @@ def full_loss(model, dataset, loss_criterion):
 # TRAINING LOOP
 # =============================================================================
 
-def train(model, optimizer, loader, epochs, method, dataset):
+def train(model, optimizer, loader, epochs, method, dataset, weight_decay=0.0):
     """
     Unified training loop for all methods.
     Handles the different outer-loop requirements for SARAH and SVRG.
     SAGA uses its own saga_step() and bypasses PyTorch autograd entirely.
 
+    Args:
+        weight_decay: L2 regularization strength lambda. Adds (lambda/2)||w||^2
+                      to the loss, guaranteeing strong convexity with mu=lambda.
+                      Controls condition number kappa = (L+lambda)/lambda.
+                      Default 0.0 = no regularization.
     Returns:
-        history: list of average losses (one per epoch, not per iteration)
-                 This gives a smooth curve that is easier to interpret.
+        history:    list of average losses (one per epoch)
+        grad_norms: list of gradient norms (one per mini-batch iteration)
     """
-    history = []
-    loss_fn = nn.BCEWithLogitsLoss()
+    history    = []
+    grad_norms = []
+
+    def loss_fn(logits, y):
+        """
+        BCE loss + optional L2 penalty on weights (not bias).
+        L2 penalty (lambda/2)||w||^2 guarantees strong convexity,
+        enabling linear convergence of SVRG and SAGA.
+        """
+        bce = nn.BCEWithLogitsLoss()(logits, y)
+        if weight_decay > 0.0:
+            l2 = (weight_decay / 2.0) * sum(
+                p.pow(2).sum()
+                for name, p in model.named_parameters()
+                if 'bias' not in name
+            )
+            return bce + l2
+        return bce
 
     for epoch in range(epochs):
 
@@ -552,7 +579,7 @@ def train(model, optimizer, loader, epochs, method, dataset):
 
         model.train()
 
-    return history
+    return history, grad_norms
 
 
 # =============================================================================
@@ -601,12 +628,12 @@ def load_dataset(name):
     if name == "synthetic":
         X, y = make_classification(
             n_samples=20000,
-            n_features=50,
-            n_informative=20,
-            n_redundant=5,
+            n_features=500,
+            n_informative=10,
+            n_redundant=490,
             n_repeated=0,
-            class_sep=1.5,
-            flip_y=0.025,
+            class_sep=0.3,
+            flip_y=0.1,
             random_state=0
         )
 
@@ -715,19 +742,21 @@ def main(args):
             model.parameters(),
             lr=args.lr,
             n_samples=n_samples,
-            n_features=n_features
+            n_features=n_features,
+            weight_decay=args.weight_decay
         )
 
     else:
         raise ValueError("--method must be one of: sgd | sarah | svrg | saga")
 
     # Train
-    history = train(model, optimizer, loader, args.epochs,
-                    method=args.method, dataset=dataset)
+    history, grad_norms = train(model, optimizer, loader, args.epochs,
+                                method=args.method, dataset=dataset,
+                                weight_decay=args.weight_decay)
 
     # Save results
     with open(f"{args.method}_results.json", "w") as f:
-        json.dump({"loss": history}, f, indent=4)
+        json.dump({"loss": history, "grad_norms": grad_norms}, f, indent=4)
 
     # Individual loss curve
     plot_loss(history, args.method)
@@ -773,5 +802,7 @@ if __name__ == "__main__":
                         help="Number of epochs (default: 10)")
     parser.add_argument("--inner-loop-size",  type=int,   default=None,
                         help="SVRG inner loop size m (default: n_samples // batch_size)")
+    parser.add_argument("--weight-decay",     type=float, default=0.01,
+                        help="L2 regularization strength lambda (default: 0.01)")
     args = parser.parse_args()
     main(args)
