@@ -59,7 +59,14 @@ def load_norms(method):
             f"           Re-run main_v4.py to regenerate results with norm logging."
         )
         return None
-    return data["grad_norms"]
+    norms = data["grad_norms"]
+    if len(norms) == 0:
+        print(
+            f"  WARNING: {path} has an empty 'grad_norms' list.\n"
+            f"           Re-run main_v4.py to regenerate results with norm logging."
+        )
+        return None
+    return norms
 
 
 def smooth(values, window):

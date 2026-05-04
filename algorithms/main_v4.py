@@ -57,69 +57,78 @@ class SGD(OptimizerBase):
         with torch.no_grad():
             for parameter, gradient in zip(self.params, self.grads):
                 parameter -= self.lr * gradient
+        return float(sum(g.pow(2).sum().item() for g in self.grads) ** 0.5)
 
 
 # =============================================================================
 # SARAH
 
 class SARAH(OptimizerBase):
-    """
-    Stochastic Recursive Gradient Algorithm (SARAH).
-    Nguyen et al., 2017. https://arxiv.org/pdf/1703.00102
-
-    Key idea: Instead of using the raw noisy mini-batch gradient,
-    build a RECURSIVE correction:
-
-        v_t = g_t - g_{t-1} + v_{t-1}
-
-    where:
-        g_t  = mini-batch gradient at current parameters
-        g_{t-1} = mini-batch gradient at PREVIOUS parameters (same batch)
-        v_{t-1} = previous corrected gradient
-
-    The noise in g_t and g_{t-1} partially cancels, reducing variance.
-    An outer loop (full gradient) resets the estimate each epoch.
-
-    Memory cost: O(d) — just stores previous gradient vector.
-    No gradient table needed (unlike SAGA).
-    """
     def __init__(self, params, lr):
         super().__init__(params, lr)
-        self.v_prev = None       # previous corrected gradient
-        self.grads_prev = None   # previous raw mini-batch gradient
+        self.v_prev = None
+        self.grads_prev = None
+        self.params_prev = None  # store previous parameters
 
     def get_outer_loop(self):
-        """
-        Called once per epoch BEFORE the inner mini-batch loop.
-        Computes the full gradient over all data and takes one step with it.
-        This 'resets' the recursive estimate to a low-noise starting point.
-        """
-        # Save full gradient as starting point for recursive correction
+        # Full gradient already computed in p.grad
         self.v_prev = [p.grad.clone() for p in self.params]
         self.grads_prev = [p.grad.clone() for p in self.params]
 
-        # Take one gradient step using the full gradient
+        # Store params BEFORE step
+        self.params_prev = [p.clone() for p in self.params]
+
         with torch.no_grad():
             for p, v0 in zip(self.params, self.v_prev):
                 p -= self.lr * v0
 
-    def step(self):
+    def step(self, closure=None):
+        """
+        closure: function that recomputes loss + gradients on CURRENT batch
+        Must use SAME mini-batch when called twice
+        """
+        if closure is None:
+            raise ValueError("SARAH requires a closure for recomputing gradients")
+
+        # ---- g_t already computed BEFORE calling step() ----
+        g_t = [g.clone() for g in self.grads]
+
+        if self.v_prev is None:
+            v = g_t
+        else:
+            # Swap to previous params — no_grad only for the tensor copies
+            with torch.no_grad():
+                current_params = [p.clone() for p in self.params]
+                for p, p_prev in zip(self.params, self.params_prev):
+                    p.copy_(p_prev)
+
+            # closure() must run OUTSIDE no_grad so backward() can compute grads
+            closure()
+            g_prev = [p.grad.clone() for p in self.params]
+
+            with torch.no_grad():
+                # Restore current params (w_t)
+                for p, p_curr in zip(self.params, current_params):
+                    p.copy_(p_curr)
+
+                # SARAH update: v_t = grad(w_t) - grad(w_{t-1}) + v_{t-1}
+                v = [g - gp + vp for g, gp, vp in zip(g_t, g_prev, self.v_prev)]
+
+        grad_norm = float(sum(vi.pow(2).sum().item() for vi in v) ** 0.5)
+
         with torch.no_grad():
-            if self.v_prev is None:
-                # First iteration: no previous values, use raw gradient
-                v = self.grads
-            else:
-                # Recursive correction: v_t = g_t - g_{t-1} + v_{t-1}
-                v = [g - gp + vp for g, gp, vp in
-                     zip(self.grads, self.grads_prev, self.v_prev)]
+            # save w_t (BEFORE stepping) so next iteration can compute grad at w_{t-1}
+            self.params_prev = [p.clone() for p in self.params]
 
-            for parameter, v_i in zip(self.params, v):
-                parameter -= self.lr * v_i
+            # parameter update
+            for p, v_i in zip(self.params, v):
+                p -= self.lr * v_i
 
-            # Save for next iteration
-            self.v_prev = v
-            self.grads_prev = self.grads
+            # ---- update stored values ----
+            self.v_prev = [vi.clone() for vi in v]
+            self.grads_prev = [g.clone() for g in g_t]
 
+        return grad_norm
 
 # =============================================================================
 # SVRG
@@ -256,15 +265,17 @@ class SVRG(OptimizerBase):
         between both gradients (they use the same mini-batch).
         mu pulls the estimate toward the true full gradient direction.
         """
+        norm_sq = 0.0
         with torch.no_grad():
             for p, g, g_snap, mu_i in zip(
                 self.params, self.grads, self.snapshot_grads, self.mu
             ):
-                # Corrected variance-reduced gradient
                 v = g - g_snap + mu_i
+                norm_sq += v.pow(2).sum().item()
                 p -= self.lr * v
 
         self.step_count += 1
+        return float(norm_sq ** 0.5)
 
 
 
@@ -413,12 +424,15 @@ class SAGA(OptimizerBase):
         batch_dw /= batch_size
         batch_db /= batch_size
 
-        # Gradient step — update PyTorch parameters directly
+        grad_norm = float((np.sum(batch_dw ** 2) + batch_db ** 2) ** 0.5)
+
         with torch.no_grad():
             self.params[0] -= self.lr * torch.tensor(
                 batch_dw.reshape(self.params[0].shape), dtype=torch.float32)
             self.params[1] -= self.lr * torch.tensor(
                 np.array([batch_db]), dtype=torch.float32)
+
+        return grad_norm
 
 
 
@@ -503,7 +517,8 @@ def train(model, optimizer, loader, epochs, method, dataset, weight_decay=0.0):
 
                 # SAGA bypasses PyTorch autograd entirely — it computes
                 # gradients manually using its own sigmoid implementation
-                optimizer.saga_step(indices, X, y)
+                grad_norm = optimizer.saga_step(indices, X, y)
+                grad_norms.append(grad_norm)
 
                 # Compute loss separately just for logging (no backward needed)
                 with torch.no_grad():
@@ -526,7 +541,21 @@ def train(model, optimizer, loader, epochs, method, dataset, weight_decay=0.0):
                 loss = loss_fn(logits, y)
                 loss.backward()
                 optimizer.store_grads()
-                optimizer.step()
+
+                # ---- SARAH needs closure ----
+                if method == "sarah":
+                    def closure():
+                        optimizer.zero_grad()
+                        logits_closure = model(X)   # SAME batch
+                        loss_closure = loss_fn(logits_closure, y)
+                        loss_closure.backward()
+                        return loss_closure
+
+                    grad_norm = optimizer.step(closure)
+                else:
+                    grad_norm = optimizer.step()
+
+                grad_norms.append(grad_norm)
 
             epoch_losses.append(loss.item())
 
