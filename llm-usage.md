@@ -192,10 +192,10 @@ The pseudocode was copied into a one-cell Word table in the report. Notation was
 **Date**: May 3, 2026
 
 **Prompt**:
-Look at this code [SARAH code], is it properly written, and will it have similar behavior to SGD in some circumstances?
+> "Look at this code [SARAH code], is it properly written, and will it have similar behavior to SGD in some circumstances?"
 
 **Output relied upon**:
-It gave two lines of code which were bugs before, "self.grads" and "v" needed to be replaced by "[p.clone() for p in self.params]" and "[vi.clone() for vi in v]" gave general suggestions that differences from SGD could be due to small batch sizes or mini-batches not being evaluated properly. 
+It gave two lines of code which were bugs before, `self.grads` and `v` needed to be replaced by `[p.clone() for p in self.params]` and `[vi.clone() for vi in v]` respectively, and it gave general suggestions that differences from SGD could be due to small batch sizes or mini-batches not being evaluated properly. 
 
 **How it was used**:
 This confirmed my suspicion based on the tests, that the SARAH code was not working properly and looking like SGD as a result. This issue was fixed the next day.
